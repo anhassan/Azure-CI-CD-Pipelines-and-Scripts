@@ -1,0 +1,218 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+variables:
+ databricks.host.hostname: 'https://adb-5663040422383261.1.azuredatabricks.net'
+ databricks.remote.hostname: 'https://adb-7366774402298153.13.azuredatabricks.net'
+ databricks.remote.workspace.id: '7366774402298153'
+ databricks.remote.scope: 'mlops-remote-registry'
+ databricks.remote.prefix: 'mlops-remote-registry-prefix'
+ repo.import.from: 'model_promotion'
+ databricks.cluster.name: 'MLOpsCluster2'
+ databricks.cluster.id: ''
+ databricks.notebook.path: '/Shared/Execution/ModelPromotion'
+ databricks.model.promotion.notebook: 'ModelPromotion'
+ databricks.model.promotion.job.name: 'model_promotion_job'
+ databricks.model.promotion.job.id: ''
+ 
+
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+- script: echo Hello, world!
+  displayName: 'Run a one-line script'
+
+# Downloading a particular Python Version
+- task: UsePythonVersion@0
+  displayName: 'Use Latest Python Version-3.8'
+  inputs:
+    versionSpec: '3.8'
+    addToPath: true
+    architecture: 'x64'
+
+# Installing Databricks CLI for running its commands
+- task: Bash@3
+  displayName : 'Install Databricks CLI'
+  inputs:
+    targetType: 'inline'
+    script: 'pip install -U databricks-cli pytest mlflow pyspark'
+
+# Configuring the Databricks CLI with Authentication Token
+- task: Bash@3
+  displayName: 'Configure Databricks CLI and some other tools'
+  inputs:
+    targetType: 'inline'
+    script: |
+      conf='cat << EOM
+      $(databricks.host.hostname)
+      $(databricks.host.token)
+      EOM'
+      echo "$conf" | databricks configure --token
+
+# Creating a directory in Databricks environment for code execution
+- task: Bash@3
+  displayName: 'Create a directory for execution of the desired notebooks'
+  inputs:
+    targetType: 'inline'
+    script: 'databricks workspace mkdirs "$(databricks.notebook.path)"'
+
+# Copying files from the specified repository path to the created directory for execution in Databricks
+- task: Bash@3
+  displayName: 'Copy files from Repo to Databricks'
+  inputs:
+    targetType: 'inline'
+    script: 'databricks workspace import_dir --overwrite "$(repo.import.from)" "$(databricks.notebook.path)"'
+
+# Starting the specified databricks cluster if it's not in starting state
+- task: Bash@3
+  displayName : 'Start the Databricks Cluster'
+  inputs:
+    targetType: 'inline'
+    script: |
+
+      # Getting the cluster_id corresponding to the cluster name
+      cluster_id=$(databricks clusters list | grep -w $(databricks.cluster.name) | awk {'print $1'} )
+      echo "Checking Cluster State of Cluster Name : $(databricks.cluster.name) with Cluster Id : $cluster_id"
+      
+      # Getting the cluster state corresponding to the cluster_id
+      cluster_state=$(databricks clusters get --cluster-id $cluster_id | jq -r ".state")
+      echo "Cluster State : $cluster_state"
+      
+      # Start the cluster when it is in terminated state
+      if [ $cluster_state == "TERMINATED" ]
+      then
+          echo "Starting Databricks Cluster"
+          $(databricks cluster start --cluster-id $cluster_id)
+          sleep 30
+          cluster_state=$(databricks clusters get --cluster-id $cluster_id | jq -r ".state")
+          echo "Cluster State : $cluster_state"
+      fi
+      
+      # Wait when the cluster is in pending state
+      while [ $cluster_state == "PENDING" ]
+      do
+        sleep 30
+        cluster_state=$(databricks clusters get --cluster-id $cluster_id | jq -r ".state")
+        echo "Cluster State : $cluster_state"
+      done
+      
+      # Wait when the cluster is resizing
+      while [ $cluster_state == "RESIZING" ]
+      do
+        sleep 30 
+        cluster_state=$(databricks clusters get --cluster-id $cluster_id | jq -r ".state")
+        echo "Cluster State : $cluster_state"
+      done
+      
+      # Exit when the cluster is in running state
+      if [ $cluster_state == "RUNNING" ]
+      then
+          # Exporting the cluster_id into the specified pipeline variable
+          echo "##vso[task.setvariable variable=databricks.cluster.id;]$cluster_id"
+          exit 0
+      else
+          exit 1
+      fi
+
+# Setting up the secrets required for model promotion to higher environments
+- task: Bash@3
+  displayName: 'Remote Registry API Setup'
+  inputs:
+    targetType: 'inline'
+    script: |
+      
+      remote_scope_name=$(databricks secrets list-scopes | grep -w $(databricks.remote.scope) | awk {'print $1'})
+      sleep 30
+      
+      # Create a secret scope in the host if doesnot exist
+      if [ -z "$remote_scope_name" ]
+      then
+          echo "Creating secret scope : $(databricks.remote.scope)"
+          databricks secrets create-scope --scope $(databricks.remote.scope) --initial-manage-principal "users"
+      else
+          echo "Secret Scope : $(databricks.remote.scope) already exists...."
+      fi
+
+      # Adding secret credentials to created/already existing scope
+      databricks secrets put --scope $(databricks.remote.scope) --key $(databricks.remote.prefix)-host --string-value $(databricks.remote.hostname)
+      databricks secrets put --scope $(databricks.remote.scope) --key $(databricks.remote.prefix)-token --string-value $(databricks.remote.token)
+      databricks secrets put --scope $(databricks.remote.scope) --key $(databricks.remote.prefix)-workspace-id --string-value $(databricks.remote.workspace.id)
+      echo "All the secrets successfully added...."
+- task: Bash@3
+  displayName : 'Model Promotion Job Setup'
+  inputs:
+    targetType: 'inline'
+    script: |
+       
+       # Checking if the job already exists or not
+       job_id=$(databricks jobs list | grep -w $(databricks.model.promotion.job.name) | awk {'print $1'})
+
+       # Create a job if doesnot exist 
+       if [ -z "$job_id" ]
+       then
+           echo "Creating Job with Job Name : $(databricks.model.promotion.job.name)"
+           model_promotion_config=$(jq -n \
+                        --arg notebook_path "$(databricks.notebook.path)/$(databricks.model.promotion.notebook)" \
+                        --arg cluster_id "$(databricks.cluster.id)" \
+                        --arg job_name "$(databricks.model.promotion.job.name)" \
+                        '{"notebook_task": {
+                    "notebook_path": $notebook_path
+                  },
+                  "existing_cluster_id": $cluster_id,
+                  "name": $job_name,
+                  "max_concurrent_runs": 3,
+                  "timeout_seconds": 86400,
+                  "libraries": [],
+                  "email_notifications": {}
+          }' )
+           job_id=$(databricks jobs create --json "$json_config_container_job" | jq -r ".job_id")
+           echo "Created Job with Job Name: $(databricks.model.promotion.job.name) and Job Id : $job_id"
+       else
+           echo "Job with Job Name : $(databricks.model.promotion.job.name) already exists....."
+       fi
+       # Exporting the cluster_id into the specified pipeline variable
+       echo "##vso[task.setvariable variable=databricks.model.promotion.job.id;]$job_id" 
+
+- task: Bash@3
+  displayName: 'Run Model Promotion Job and Notebook'
+  inputs:
+    targetType: 'inline'
+    script: |
+    
+      # Running the job created for training
+      echo "Running job with Job Name : $(databricks.model.promotion.job.name) with Job Id : $(databricks.model.promotion.job.id)"
+      run_id=$(databricks jobs run-now --job-id $(databricks.model.promotion.job.id) --notebook-params '{"scope" : $(databricks.remote.scope), "prefix":$(databricks.remote.prefix) }' | jq -r ".run_id")
+      echo "Running Job with Run Id : $run_id"
+      
+      # Get the state of the job started
+      run_state=$(databricks runs get --run-id $run_id | jq -r ".state.life_cycle_state")
+      echo "Run State : $run_state of Run Id : $run_id"
+      
+      # Wait for running or pending job
+      while [ $run_state == "RUNNING" ] || [ $run_state == "PENDING" ]
+      do
+        sleep 30
+        run_state=$(databricks runs get --run-id $run_id | jq -r ".state.life_cycle_state")
+        echo "Run State : $run_state of Run Id : $run_id"
+      done
+      
+      # Getting the result state and state message of the terminated job
+      result_state=$(databricks runs get --run-id $run_id | jq -r ".state.result_state")
+      state_msg=$(databricks runs get --run-id $run_id | jq -r ".state.state_message")
+      echo "Job Id : $job_id with Result State : $result_state and State Message : $state_msg"
+      
+      # Exit gracefully if run was successful otherwise throw error
+      if [ $result_state == "SUCCESS" ]
+      then
+          echo "Run Id : $run_id completed successfully....."
+          echo "Model Promoted Successfully...."
+          exit 0
+      else
+          echo "Run Id : $run_id failed......"
+          echo "Model Promotion failed..."
+          exit 1
+      fi

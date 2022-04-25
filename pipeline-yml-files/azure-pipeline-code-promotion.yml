@@ -1,0 +1,113 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+variables:
+ databricks.hostname.host: 'https://adb-5663040422383261.1.azuredatabricks.net'
+ databricks.import.path.host: '/Shared/CodePromotion'
+ databricks.hostname.remote: 'https://adb-7366774402298153.13.azuredatabricks.net'
+ databricks.remote.migration.directory: '/CodeMigration'
+ agent.staging.directory: 'staging_dir'
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+- script: echo Hello, world!
+  displayName: 'Run a one-line script'
+
+# Downloading a particular Python Version
+- task: UsePythonVersion@0
+  displayName: 'Use Latest Python Version-3.8'
+  inputs:
+    versionSpec: '3.8'
+    addToPath: true
+    architecture: 'x64'
+
+# Installing Databricks CLI for running its commands
+- task: Bash@3
+  displayName : 'Install Databricks CLI'
+  inputs:
+    targetType: 'inline'
+    script: 'pip install -U databricks-cli pytest mlflow pyspark'
+
+# Configuring the Databricks CLI For Host Workspace
+- task: Bash@3
+  displayName: 'Configure Databricks CLI For Host'
+  inputs:
+    targetType: 'inline'
+    script: |
+      conf='cat << EOM
+      $(databricks.hostname.host)
+      $(databricks.token.host)
+      EOM'
+      echo "$conf" | databricks configure --token
+
+- task: Bash@3
+  displayName: 'Importing and Staging code to Agent'
+  inputs:
+    targetType: 'inline'
+    script: |
+      
+      # Making a staging directory for importing code
+      mkdir -p $(agent.staging.directory)
+
+      # Importing code from databricks workspace and pushing it into the staging directory
+      databricks workspace export_dir --overwrite $(databricks.import.path.host) $(agent.staging.directory)
+
+      # Validating the code export from databricks to agent
+      if [ -z "$(ls -A $(agent.staging.directory))" ]
+      then
+          echo "Code Staging to Agent Directory : $(agent.staging.directory) Failed...."
+          exit 1
+      else
+          echo "Files Loaded to Staging : "
+          echo "$(ls -A $(agent.staging.directory))"
+          echo "Code Staging to Agent Directory : $(agent.staging.directory) Successful..."
+          exit 0
+      fi
+
+# Configuring the Databricks CLI For Remote Workspace
+- task: Bash@3
+  displayName: 'Configure Databricks Remote Workspace CLI'
+  inputs:
+    targetType: 'inline'
+    script: |
+      conf='cat << EOM
+      $(databricks.hostname.remote)
+      $(databricks.token.remote)
+      EOM'
+      echo "$conf" | databricks configure --token
+
+# Create a new directory in Remote Workspace to move Code from Agent
+- task: Bash@3
+  displayName: 'Create Migration Directory in Remote Workspace'
+  inputs:
+    targetType: 'inline'
+    # Creating new directory for code migration
+    script: 'databricks workspace mkdirs "$(databricks.remote.migration.directory)"'
+
+
+# Load the Code from the Agent Staging Directory to Remote Workspace
+- task: Bash@3
+  displayName: 'Code Migration from Staging'
+  inputs:
+    targetType: 'inline'
+    script: |
+    
+      # Migrate code from Agent Staging 
+      databricks workspace import_dir --overwrite $(agent.staging.directory) $(databricks.remote.migration.directory)
+
+      # Validating the code migration from agent to remote workspace
+      workspace_contents=$(databricks workspace ls --absolute $(databricks.remote.migration.directory))
+      if [ -z "$workspace_contents" ]
+      then
+          echo "Code Migration to Remote Directory Path : $(databricks.remote.migration.directory) Failed...."
+          exit 1
+      else
+          echo "Contents Migrated : "
+          echo "$workspace_contents"
+          echo "Code Migrated to Remote Directory Path : $(databricks.remote.migration.directory) Successful..."
+          exit 0
+      fi

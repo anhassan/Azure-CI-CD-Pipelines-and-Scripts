@@ -1,0 +1,385 @@
+trigger:
+- main
+
+variables:
+  repo.import.from: 'notebooks'
+  databricks.host: 'https://adb-5663040422383261.1.azuredatabricks.net'
+  databricks.notebook.path : '/Shared/Execution'
+  databricks.cluster.name : 'MLOpsCluster2'
+  databricks.cluster.id:
+  databricks.train.job.name : 'training_job_mlflow'
+  databricks.train.notebook.name : 'Training'
+  databricks.train.job.id:
+  databricks.experiment.name: '/Spark_Train_Exp'
+  databricks.containerization.job.name : 'deployment_job'
+  databricks.containerization.notebook.name : 'deploy_to_aks'
+  databricks.containerization.job.id : 
+  databricks.model.scoring.uri :
+  databricks.model.query.key : 
+  databricks.inference.job.name : 'inference_job'
+  databricks.inference.notebook.name : 'query_aks_rest'
+  databricks.inference.job.id : 
+  
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+- script: echo Hello, world!
+  displayName: 'Run a one-line script'
+
+# Downloading a particular Python Version
+- task: UsePythonVersion@0
+  displayName: 'Use Latest Python Version-3.8'
+  inputs:
+    versionSpec: '3.8'
+    addToPath: true
+    architecture: 'x64'
+
+# Installing Databricks CLI for running its commands
+- task: Bash@3
+  displayName : 'Install Databricks CLI'
+  inputs:
+    targetType: 'inline'
+    script: 'pip install -U databricks-cli pytest mlflow pyspark'
+
+# Configuring the Databricks CLI with Authentication Token
+- task: Bash@3
+  displayName: 'Configure Databricks CLI and some other tools'
+  inputs:
+    targetType: 'inline'
+    script: |
+      conf='cat << EOM
+      $(databricks.host)
+      $(databricks.token)
+      EOM'
+      echo "$conf" | databricks configure --token
+
+# Creating a directory in Databricks environment for code execution
+- task: Bash@3
+  displayName: 'Create a directory for execution of the desired notebooks'
+  inputs:
+    targetType: 'inline'
+    script: 'databricks workspace mkdirs "$(databricks.notebook.path)"'
+
+# Copying files from the specified repository path to the created directory for execution in Databricks
+- task: Bash@3
+  displayName: 'Copy files from Repo to Databricks'
+  inputs:
+    targetType: 'inline'
+    script: 'databricks workspace import_dir --overwrite "$(repo.import.from)" "$(databricks.notebook.path)"'
+
+# Starting the specified databricks cluster if it's not in starting state
+- task: Bash@3
+  displayName : 'Start the Databricks Cluster'
+  inputs:
+    targetType: 'inline'
+    script: |
+
+      # Getting the cluster_id corresponding to the cluster name
+      cluster_id=$(databricks clusters list | grep -w $(databricks.cluster.name) | awk {'print $1'} )
+      echo "Checking Cluster State of Cluster Name : $(databricks.cluster.name) with Cluster Id : $cluster_id"
+      
+      # Getting the cluster state corresponding to the cluster_id
+      cluster_state=$(databricks clusters get --cluster-id $cluster_id | jq -r ".state")
+      echo "Cluster State : $cluster_state"
+      
+      # Start the cluster when it is in terminated state
+      if [ $cluster_state == "TERMINATED" ]
+      then
+          echo "Starting Databricks Cluster"
+          $(databricks cluster start --cluster-id $cluster_id)
+          sleep 30
+          cluster_state=$(databricks clusters get --cluster-id $cluster_id | jq -r ".state")
+          echo "Cluster State : $cluster_state"
+      fi
+      
+      # Wait when the cluster is in pending state
+      while [ $cluster_state == "PENDING" ]
+      do
+        sleep 30
+        cluster_state=$(databricks clusters get --cluster-id $cluster_id | jq -r ".state")
+        echo "Cluster State : $cluster_state"
+      done
+      
+      # Wait when the cluster is resizing
+      while [ $cluster_state == "RESIZING" ]
+      do
+        sleep 30 
+        cluster_state=$(databricks clusters get --cluster-id $cluster_id | jq -r ".state")
+        echo "Cluster State : $cluster_state"
+      done
+      
+      # Exit when the cluster is in running state
+      if [ $cluster_state == "RUNNING" ]
+      then
+          # Exporting the cluster_id into the specified pipeline variable
+          echo "##vso[task.setvariable variable=databricks.cluster.id;]$cluster_id"
+          exit 0
+      else
+          exit 1
+      fi
+
+# Creating a job for running the training notebook
+- task: Bash@3
+  displayName: 'Create a Train Job if it does not exist'
+  inputs:
+    targetType: 'inline'
+    script: |
+
+      # Getting the job id corresponding to the job name if it exists
+      job_id=$(databricks jobs list | grep -w $(databricks.train.job.name) | awk {'print $1'})
+      echo "Cluster id: $(databricks.cluster.id)"
+      
+      #Create a new job if job with specified name doesnot exist
+      if [ -z "$job_id" ]
+      then
+          echo "Cluster id: $(databricks.cluster.id)"
+          echo "Creating Job with Job Name : $(databricks.train.job.name) ....." 
+          job_json_config=$( jq -n \
+                  --arg notebook_path "$(databricks.notebook.path)/$(databricks.train.notebook.name)" \
+                  --arg cluster_id "$(databricks clusters list | grep -w $(databricks.cluster.name) | awk {'print $1'} )" \
+                  --arg job_name "$(databricks.train.job.name)" \
+            '{"notebook_task": {
+              "notebook_path": $notebook_path
+            },
+            "existing_cluster_id": $cluster_id,
+            "name": $job_name,
+             }' )
+          
+          job_id=$(databricks jobs create --json "$job_json_config" | jq -r ".job_id")
+          echo "Created Job Name : $(databricks.train.job.name) with Job Id : $job_id....."
+      else
+          echo "Job with Job Name : $(databricks.train.job.name) already exists......"
+      fi
+      
+      # Exporting the job_id into the specified pipeline variable
+      echo "##vso[task.setvariable variable=databricks.train.job.id;]$job_id"
+      
+# Running the training job and checking its status
+- task: Bash@3
+  displayName: 'Run Job and Training Notebook'
+  inputs:
+    targetType: 'inline'
+    script: |
+    
+      # Running the job created for training
+      echo "Running job with Job Name : $(databricks.train.job.name) with Job Id : $(databricks.train.job.id)"
+      training_params=$(jq -n \
+                        --arg experiment "$(databricks.experiment.name)" \
+                        '{"ml_exp_name" : $experiment,
+                          "max_iters" : "50"
+                         }' )
+      echo "Training Parameters : $training_params"
+      run_id=$(databricks jobs run-now --job-id $(databricks.train.job.id) --notebook-params "$training_params" | jq -r ".run_id")
+      echo "Running Job with Run Id : $run_id"
+      
+      # Get the state of the job started
+      run_state=$(databricks runs get --run-id $run_id | jq -r ".state.life_cycle_state")
+      echo "Run State : $run_state of Run Id : $run_id"
+      
+      # Wait for running or pending job
+      while [ $run_state == "RUNNING" ] || [ $run_state == "PENDING" ]
+      do
+        sleep 30
+        run_state=$(databricks runs get --run-id $run_id | jq -r ".state.life_cycle_state")
+        echo "Run State : $run_state of Run Id : $run_id"
+      done
+      
+      # Getting the result state and state message of the terminated job
+      result_state=$(databricks runs get --run-id $run_id | jq -r ".state.result_state")
+      state_msg=$(databricks runs get --run-id $run_id | jq -r ".state.state_message")
+      echo "Job Id : $job_id with Result State : $result_state and State Message : $state_msg"
+      
+      # Exit gracefully if run was successful otherwise throw error
+      if [ $result_state == "SUCCESS" ]
+      then
+          echo "Run Id : $run_id completed successfully....."
+          exit 0
+      else
+          echo "Run Id : $run_id failed......"
+          exit 1
+      fi
+
+# Creating a job for deployment of the model to aks
+- task: Bash@3
+  displayName: 'Create an aks deployment job'
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Checking if the job with the present job name already exists or not
+      container_job_id=$(databricks jobs list | grep -w $(databricks.containerization.job.name) | awk {'print $1'})
+      
+      # Create a job if does not exist 
+      if [ -z "$container_job_id" ]
+      then
+      	echo "Creating Job with Job Name : $(databricks.containerization.job.name) ....." 
+        json_config_container_job=$(jq -n \
+                        --arg notebook_path "$(databricks.notebook.path)/$(databricks.containerization.notebook.name)" \
+                        --arg cluster_id "$(databricks.cluster.id)" \
+                        --arg job_name "$(databricks.containerization.job.name)" \
+                        '{"notebook_task": {
+                    "notebook_path": $notebook_path
+                  },
+                  "existing_cluster_id": $cluster_id,
+                  "name": $job_name,
+                  "max_concurrent_runs": 3,
+                  "timeout_seconds": 86400,
+                  "libraries": [],
+                  "email_notifications": {}
+          }' )
+        echo "Json config : $json_configcontainer_job"
+        container_job_id=$(databricks jobs create --json "$json_config_container_job" | jq -r ".job_id")
+        echo "Created job with Job Name : $(databricks.containerization.job.name) and Job Id : $container_job_id"
+      else
+      	echo "Job with Job Name : $(databricks.containerization.job.name) and Job Id : $container_job_id already exists...."
+      fi
+      
+      # Exporting the containerization job_id into the specified pipeline variable
+      echo "##vso[task.setvariable variable=databricks.containerization.job.id;]$container_job_id"
+
+# Running the Deployment to AKS Job and Persisting the Scoring Uri and Query Key for Inference
+- task: Bash@3
+  displayName: 'Running deployment to Aks Job'
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Running the job for making image of the model
+      run_id=$(databricks jobs run-now --job-id $(databricks.containerization.job.id) | jq -r ".run_id")
+      echo "Running Job with Run Id : $run_id"
+      
+      # Get the state of the run started
+      run_state=$(databricks runs get --run-id $run_id | jq -r ".state.life_cycle_state")
+      echo "Run Sate : $run_state"
+      
+      while [ $run_state == "RUNNING" ] || [ $run_state == "PENDING" ]
+      do
+          sleep 30 
+          run_state=$(databricks runs get --run-id $run_id | jq -r ".state.life_cycle_state") 
+          echo "Run State : $run_state"
+      done
+      
+      # Getting the result state and state message of the terminated job
+      result_state=$(databricks runs get --run-id $run_id | jq -r ".state.result_state")
+      state_msg=$(databricks runs get --run-id $run_id | jq -r ".state.state_message")
+      echo "Job Id : $(databricks.containerization.job.id) with Result State : $result_state and State Message : $state_msg"
+      
+      # Create a metastore and push the image in it if run succeded otherwise exit gracefully
+      if [ $result_state == "SUCCESS" ]
+      then
+          echo "Run Id : $run_id successfull...."
+          echo "Deployment to AKS successfull...."
+
+          # Fetching the scoring uri and key for inference job
+          scoring_uri=$(databricks runs get-output --run-id $run_id | jq -r ".notebook_output.result" | jq -r ".scoring_uri")
+          query_key=$(databricks runs get-output --run-id $run_id | jq -r ".notebook_output.result" | jq -r ".query_key")
+          
+          # Checking whether the scope exists or not
+          inference_scope_name=$(databricks secrets list-scopes | grep -w $(databricks.inference.scope) | awk {'print $1'})
+          sleep 30
+          
+          # Create a secret scope if doesnot exist
+          if [ -z "$inference_scope_name" ]
+          then
+              echo "Creating secret scope : $(databricks.inference.scope)"
+              databricks secrets create-scope --scope $(databricks.inference.scope) --initial-manage-principal "users"
+          else
+              echo "Secret Scope : $(databricks.inference.scope) already exists...."
+          fi
+
+          # Adding scoring_uri and key to created/already existing scope
+          databricks secrets put --scope $(databricks.inference.scope) --key $(databricks.inference.uri.name) --string-value $(scoring_uri)
+          databricks secrets put --scope $(databricks.inference.scope) --key $(databricks.inference.key.name) --string-value $(query_key)
+          echo "All the secrets successfully added...."
+
+          # Push the inference scope and keynames to the repo for the inference pipeline
+
+      else
+          echo "Run with Run Id : $run_id failed....."
+          exit 1
+      fi
+
+# Setting up an inference job
+- task: Bash@3
+  displayName: 'Create an inference job'
+  inputs:
+    targetType: 'inline'
+    script: |
+
+      # Checking if the job with the present job name already exists or not
+      inference_job_id=$(databricks jobs list | grep -w $(databricks.inference.job.name) | awk {'print $1'})
+      
+      # Create a job if does not exist 
+      if [ -z "$inference_job_id" ]
+      then
+      	echo "Creating Job with Job Name : $(databricks.inference.job.name) ....." 
+        json_config_inference_job=$(jq -n \
+                        --arg notebook_path "$(databricks.notebook.path)/$(databricks.inference.notebook.name)" \
+                        --arg cluster_id "$(databricks.cluster.id)" \
+                        --arg job_name "$(databricks.inference.job.name)" \
+                        '{"notebook_task": {
+                    "notebook_path": $notebook_path
+                  },
+                  "existing_cluster_id": $cluster_id,
+                  "name": $job_name,
+                  "max_concurrent_runs": 3,
+                  "timeout_seconds": 86400,
+                  "libraries": [],
+                  "email_notifications": {}
+          }' )
+        echo "Json config : $json_config_inference_job"
+        inference_job_id=$(databricks jobs create --json "$json_config_inference_job" | jq -r ".job_id")
+        echo "Created job with Job Name : $(databricks.inference.job.name) and Job Id : $inference_job_id"
+      else
+      	echo "Job with Job Name : $(databricks.inference.job.name) and Job Id : $inference_job_id already exists...."
+      fi
+      
+      # Exporting the inference job_id into the specified pipeline variable
+      echo "##vso[task.setvariable variable=databricks.inference.job.id;]$inference_job_id"
+
+# Running the inference job and checking its status
+- task: Bash@3
+  displayName: 'Run Job and Inference Notebook'
+  inputs:
+    targetType: 'inline'
+    script: |
+    
+      # Running the job created for inference
+      echo "Running job with Job Name : $(databricks.inference.job.name) with Job Id : $(databricks.inference.job.id)"
+      inference_params=$(jq -n \
+                        --arg scoring_uri "$(databricks.model.scoring.uri)" \
+                        --arg query_key "$(databricks.cluster.id)" \
+                        '{"uri" : $scoring_uri,
+                          "key" : $query_key
+                         }' )
+      echo "Inference Params : $inference_params"
+      run_id=$(databricks jobs run-now --job-id $(databricks.inference.job.id) --notebook-params "$inference_params" | jq -r ".run_id")
+      echo "Running Job with Run Id : $run_id"
+      
+      # Get the state of the job started
+      run_state=$(databricks runs get --run-id $run_id | jq -r ".state.life_cycle_state")
+      echo "Run State : $run_state of Run Id : $run_id"
+      
+      # Wait for running or pending job
+      while [ $run_state == "RUNNING" ] || [ $run_state == "PENDING" ]
+      do
+        sleep 30
+        run_state=$(databricks runs get --run-id $run_id | jq -r ".state.life_cycle_state")
+        echo "Run State : $run_state of Run Id : $run_id"
+      done
+      
+      # Getting the result state and state message of the terminated job
+      result_state=$(databricks runs get --run-id $run_id | jq -r ".state.result_state")
+      state_msg=$(databricks runs get --run-id $run_id | jq -r ".state.state_message")
+      echo "Job Id : $job_id with Result State : $result_state and State Message : $state_msg"
+      
+      # Exit gracefully if run was successful otherwise throw error
+      if [ $result_state == "SUCCESS" ]
+      then
+          echo "Run Id : $run_id completed successfully....."
+          exit 0
+      else
+          echo "Run Id : $run_id failed......"
+          exit 1
+      fi
+
